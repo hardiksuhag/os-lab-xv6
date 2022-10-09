@@ -1,0 +1,778 @@
+diff -ruN Task2_old/Makefile Task2/Makefile
+--- Task2_old/Makefile	2021-09-15 22:00:34.961855400 +0530
++++ Task2/Makefile	2021-09-15 22:49:49.372586400 +0530
+@@ -181,6 +181,7 @@
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_wait2test\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+diff -ruN Task2_old/console.c Task2/console.c
+--- Task2_old/console.c	2021-09-15 22:00:34.998495000 +0530
++++ Task2/console.c	2021-09-15 23:21:42.000000000 +0530
+@@ -15,6 +15,25 @@
+ #include "proc.h"
+ #include "x86.h"
+ 
++#define UP_ARROW 226
++#define DOWN_ARROW 227
++#define LEFT_ARROW 228
++#define RIGHT_ARROW 229
++
++#define BACKSPACE 0x100
++#define CRTPORT 0x3d4
++
++#define INPUT_BUF 128
++#define MAX_HISTORY 16
++
++void eraseCurrentLineOnScreen(void);
++void copyCharsToBeMovedToOldBuf(void);
++void eraseContentOnInputBuf();
++void copyBufferToScreen(char * bufToPrintOnScreen, uint length);
++void copyBufferToInputBuf(char * bufToSaveInInput, uint length);
++void saveCommandInHistory();
++int history(char *buffer, int historyId);
++
+ static void consputc(int);
+ 
+ static int panicked = 0;
+@@ -124,8 +143,7 @@
+ }
+ 
+ //PAGEBREAK: 50
+-#define BACKSPACE 0x100
+-#define CRTPORT 0x3d4
++
+ static ushort *crt = (ushort*)P2V(0xb8000);  // CGA memory
+ 
+ static void
+@@ -139,12 +157,19 @@
+   outb(CRTPORT, 15);
+   pos |= inb(CRTPORT+1);
+ 
+-  if(c == '\n')
+-    pos += 80 - pos%80;
+-  else if(c == BACKSPACE){
+-    if(pos > 0) --pos;
+-  } else
+-    crt[pos++] = (c&0xff) | 0x0700;  // black on white
++  switch(c) {
++    case '\n':
++      pos += 80 - pos%80;
++      break;
++    case BACKSPACE:
++      if(pos > 0) --pos;
++      break;
++    case LEFT_ARROW:
++      if(pos > 0) --pos;
++      break;
++    default:
++      crt[pos++] = (c&0xff) | 0x0700;  // black on white
++  }
+ 
+   if(pos < 0 || pos > 25*80)
+     panic("pos under/overflow");
+@@ -170,61 +195,224 @@
+     for(;;)
+       ;
+   }
+-
+-  if(c == BACKSPACE){
+-    uartputc('\b'); uartputc(' '); uartputc('\b');
+-  } else
+-    uartputc(c);
++  switch (c) {
++    case BACKSPACE:
++      // uartputc prints to Linux's terminal
++      uartputc('\b'); uartputc(' '); uartputc('\b');  // uart is writing to the linux shell
++      break;
++    case LEFT_ARROW:
++      uartputc('\b');
++      break;
++    default:
++      uartputc(c);
++  }
+   cgaputc(c);
+ }
+ 
+-#define INPUT_BUF 128
+ struct {
+   char buf[INPUT_BUF];
+   uint r;  // Read index
+   uint w;  // Write index
+   uint e;  // Edit index
++  uint rightmost; // Position of first empty char
+ } input;
+ 
++char charsToBeMoved[INPUT_BUF];  // temporary storage for input.buf in a certain context
++
++struct {
++  char bufferArr[MAX_HISTORY][INPUT_BUF]; // Holds the commands as strings
++  uint lengthsArr[MAX_HISTORY]; // Length of each command String
++  uint lastCommandIndex;  // The index of the last command entered to history
++  int numOfCommmandsInMem; // Number of Command's history in memory
++  int currentHistory; // Hold's the current history view (the oldest will be MAX_HISTORY-1)
++} historyBufferArray;
++
++char oldBuf[INPUT_BUF]; // The details of the command written before accessing history
++uint lengthOfOldBuf;
++
++char buf2[INPUT_BUF];
++
+ #define C(x)  ((x)-'@')  // Control-x
+ 
++void copyCharsToBeMoved() {
++  uint n = input.rightmost - input.r;
++  uint i;
++  for (i = 0; i < n; i++)
++    charsToBeMoved[i] = input.buf[(input.e + i) % INPUT_BUF];
++}
++
++void shiftbufright() {
++  uint n = input.rightmost - input.e;
++  int i;
++  for (i = 0; i < n; i++) {
++
++    char c = charsToBeMoved[i];
++    input.buf[(input.e + i) % INPUT_BUF] = c;
++    consputc(c);
++  }
++  // reset charsToBeMoved for future use
++  memset(charsToBeMoved, '\0', INPUT_BUF);
++  // return the caret to its correct position
++  for (i = 0; i < n; i++) {
++    consputc(LEFT_ARROW);
++  }
++}
++
++void shiftbufleft() {
++  uint n = input.rightmost - input.e;
++  uint i;
++  consputc(LEFT_ARROW);
++  input.e--;
++  for (i = 0; i < n; i++) {
++    char c = input.buf[(input.e + i + 1) % INPUT_BUF];
++    input.buf[(input.e + i) % INPUT_BUF] = c;
++    consputc(c);
++  }
++  input.rightmost--;
++  consputc(' '); // delete the last char in line
++  for (i = 0; i <= n; i++) {
++    consputc(LEFT_ARROW); // shift the caret back to the left
++  }
++}
++
++
++
+ void
+ consoleintr(int (*getc)(void))
+ {
+   int c, doprocdump = 0;
+-
++  uint tempIndex;
+   acquire(&cons.lock);
+   while((c = getc()) >= 0){
+     switch(c){
+-    case C('P'):  // Process listing.
+-      // procdump() locks cons.lock indirectly; invoke later
+-      doprocdump = 1;
+-      break;
+-    case C('U'):  // Kill line.
+-      while(input.e != input.w &&
+-            input.buf[(input.e-1) % INPUT_BUF] != '\n'){
+-        input.e--;
+-        consputc(BACKSPACE);
+-      }
+-      break;
+-    case C('H'): case '\x7f':  // Backspace
+-      if(input.e != input.w){
+-        input.e--;
+-        consputc(BACKSPACE);
+-      }
+-      break;
+-    default:
+-      if(c != 0 && input.e-input.r < INPUT_BUF){
+-        c = (c == '\r') ? '\n' : c;
+-        input.buf[input.e++ % INPUT_BUF] = c;
+-        consputc(c);
+-        if(c == '\n' || c == C('D') || input.e == input.r+INPUT_BUF){
+-          input.w = input.e;
+-          wakeup(&input.r);
++      // On press of Ctrl + 'P'
++      case C('P'):  // Process listing.
++        doprocdump = 1;   // procdump() locks cons.lock indirectly; invoke later
++        break;
++      // On press of Ctrl + 'U'
++      case C('U'):  // Kill line.
++        if (input.rightmost > input.e) { // caret isn't at the end of the line
++          uint numtoshift = input.rightmost - input.e;
++          uint placestoshift = input.e - input.w;
++          uint i;
++          for (i = 0; i < placestoshift; i++) {
++            consputc(LEFT_ARROW);
++          }
++          memset(buf2, '\0', INPUT_BUF);
++          for (i = 0; i < numtoshift; i++) {
++            buf2[i] = input.buf[(input.w + i + placestoshift) % INPUT_BUF];
++          }
++          for (i = 0; i < numtoshift; i++) {
++            input.buf[(input.w + i) % INPUT_BUF] = buf2[i];
++          }
++          input.e -= placestoshift;
++          input.rightmost -= placestoshift;
++          for (i = 0; i < numtoshift; i++) { // repaint the chars
++            consputc(input.buf[(input.e + i) % INPUT_BUF]);
++          }
++          for (i = 0; i < placestoshift; i++) { // erase the leftover chars
++            consputc(' ');
++          }
++          for (i = 0; i < placestoshift + numtoshift; i++) { // move the caret back to the left
++            consputc(LEFT_ARROW);
++          }
++        }
++        else { // caret is at the end of the line -                                       ( deleting everything from both screen and inputbuf)
++          while(input.e != input.w &&
++                input.buf[(input.e - 1) % INPUT_BUF] != '\n'){
++            input.e--;
++            input.rightmost--;
++            consputc(BACKSPACE);
++          }
++        }
++        break;
++      // On press of Ctrl + 'H' or Backspace
++      case C('H'): case '\x7f':  // Backspace
++        if (input.rightmost != input.e && input.e != input.w) { // caret isn't at the end of the line
++          shiftbufleft();
++          break;
++        }
++        if(input.e != input.w){ // caret is at the end of the line - deleting last char
++          input.e--;
++          input.rightmost--;
++          consputc(BACKSPACE);
++        }
++        break;
++      // On the press of Left Arrow
++      case LEFT_ARROW:
++        if (input.e != input.w) {
++          input.e--;
++          consputc(c);
++        }
++        break;
++      case RIGHT_ARROW:
++        if (input.e < input.rightmost) {
++          consputc(input.buf[input.e % INPUT_BUF]);
++          input.e++;
++        }
++        else if (input.e == input.rightmost){
++          consputc(' ');
++          consputc(LEFT_ARROW);
++        }
++        break;
++      case UP_ARROW:
++       if (historyBufferArray.currentHistory < historyBufferArray.numOfCommmandsInMem-1 ){ // current history means the oldest possible will be MAX_HISTORY-1
++          eraseCurrentLineOnScreen();
++          if (historyBufferArray.currentHistory == -1)
++              copyCharsToBeMovedToOldBuf();
++          eraseContentOnInputBuf();
++          historyBufferArray.currentHistory++;
++          tempIndex = (historyBufferArray.lastCommandIndex + historyBufferArray.currentHistory) %MAX_HISTORY;
++          copyBufferToScreen(historyBufferArray.bufferArr[ tempIndex]  , historyBufferArray.lengthsArr[tempIndex]);
++          copyBufferToInputBuf(historyBufferArray.bufferArr[ tempIndex]  , historyBufferArray.lengthsArr[tempIndex]);
+         }
++        break;
++      case DOWN_ARROW:
++        switch(historyBufferArray.currentHistory){
++          case -1:
++            //does nothing
++            break;
++          case 0: //get string from old buf
++            eraseCurrentLineOnScreen();
++            copyBufferToInputBuf(oldBuf, lengthOfOldBuf);
++            copyBufferToScreen(oldBuf, lengthOfOldBuf);
++            historyBufferArray.currentHistory--;
++            break;
++          default:
++            eraseCurrentLineOnScreen();
++            historyBufferArray.currentHistory--;
++            tempIndex = (historyBufferArray.lastCommandIndex + historyBufferArray.currentHistory)%MAX_HISTORY;
++            copyBufferToScreen(historyBufferArray.bufferArr[ tempIndex]  , historyBufferArray.lengthsArr[tempIndex]);
++            copyBufferToInputBuf(historyBufferArray.bufferArr[ tempIndex]  , historyBufferArray.lengthsArr[tempIndex]);
++            break;
++        }
++        break;
++      case '\n':
++      case '\r':
++          input.e = input.rightmost;
++      default:
++        if(c != 0 && input.e-input.r < INPUT_BUF){
++          c = (c == '\r') ? '\n' : c;
++          if (input.rightmost > input.e) { // caret isn't at the end of the line
++            copyCharsToBeMoved();
++            input.buf[input.e++ % INPUT_BUF] = c;
++            input.rightmost++;
++            consputc(c);
++            shiftbufright();
++          }
++          else {
++            input.buf[input.e++ % INPUT_BUF] = c;
++            input.rightmost = input.e - input.rightmost == 1 ? input.e : input.rightmost;
++            consputc(c);
++          }
++          if(c == '\n' || c == C('D') || input.rightmost == input.r + INPUT_BUF){
++            saveCommandInHistory();
++            input.w = input.rightmost;
++            wakeup(&input.r);
++          }
++        }
++        break;
+       }
+-      break;
+-    }
+   }
+   release(&cons.lock);
+   if(doprocdump) {
+@@ -232,6 +420,73 @@
+   }
+ }
+ 
++void
++eraseCurrentLineOnScreen(void){
++    uint numToEarase = input.rightmost - input.r;
++    uint i;
++    for (i = 0; i < numToEarase; i++) {
++      consputc(BACKSPACE);
++    }
++}
++
++void
++copyCharsToBeMovedToOldBuf(void){
++    lengthOfOldBuf = input.rightmost - input.r;
++    uint i;
++    for (i = 0; i < lengthOfOldBuf; i++) {
++        oldBuf[i] = input.buf[(input.r+i)%INPUT_BUF];
++    }
++}
++
++void
++eraseContentOnInputBuf(){
++  input.rightmost = input.r;
++  input.e = input.r;
++}
++
++void
++copyBufferToScreen(char * bufToPrintOnScreen, uint length){
++  uint i;
++  for (i = 0; i < length; i++) {
++    consputc(bufToPrintOnScreen[i]);
++  }
++}
++
++void
++copyBufferToInputBuf(char * bufToSaveInInput, uint length){
++  uint i;
++  for (i = 0; i < length; i++) {
++    input.buf[(input.r+i)%INPUT_BUF] = bufToSaveInInput[i];
++  }
++  input.e = input.r+length;
++  input.rightmost = input.e;
++}
++
++void
++saveCommandInHistory(){
++  historyBufferArray.currentHistory= -1;//reseting the users history current viewed
++  if (historyBufferArray.numOfCommmandsInMem < MAX_HISTORY)
++    historyBufferArray.numOfCommmandsInMem++; //when we get to MAX_HISTORY commands in memory we keep on inserting to the array in a circular mution
++  uint l = input.rightmost-input.r -1;
++  historyBufferArray.lastCommandIndex = (historyBufferArray.lastCommandIndex - 1)%MAX_HISTORY;
++  historyBufferArray.lengthsArr[historyBufferArray.lastCommandIndex] = l;
++  uint i;
++  for (i = 0; i < l; i++) { //do not want to save in memory the last char '/n'
++    historyBufferArray.bufferArr[historyBufferArray.lastCommandIndex][i] =  input.buf[(input.r+i)%INPUT_BUF];
++  }
++}
++
++int history(char *buffer, int historyId) {
++  if (historyId < 0 || historyId > MAX_HISTORY - 1)
++    return 2;
++  if (historyId >= historyBufferArray.numOfCommmandsInMem )
++    return 1;
++  memset(buffer, '\0', INPUT_BUF);
++  int tempIndex = (historyBufferArray.lastCommandIndex + historyId) % MAX_HISTORY;
++  memmove(buffer, historyBufferArray.bufferArr[tempIndex], historyBufferArray.lengthsArr[tempIndex]);
++  return 0;
++}
++
+ int
+ consoleread(struct inode *ip, char *dst, int n)
+ {
+@@ -295,5 +550,8 @@
+   cons.locking = 1;
+ 
+   ioapicenable(IRQ_KBD, 0);
++
++  historyBufferArray.numOfCommmandsInMem=0;
++  historyBufferArray.lastCommandIndex=0;
+ }
+ 
+diff -ruN Task2_old/defs.h Task2/defs.h
+--- Task2_old/defs.h	2021-09-15 22:00:35.007232400 +0530
++++ Task2/defs.h	2021-09-16 03:12:29.000000000 +0530
+@@ -10,6 +10,9 @@
+ struct stat;
+ struct superblock;
+ 
++#define INPUT_BUF 128
++#define MAX_HISTORY 16
++
+ // bio.c
+ void            binit(void);
+ struct buf*     bread(uint, uint);
+@@ -22,6 +25,8 @@
+ void            consoleintr(int(*)(void));
+ void            panic(char*) __attribute__((noreturn));
+ 
++int history(char *, int );
++
+ // exec.c
+ int             exec(char*, char**);
+ 
+@@ -118,6 +123,7 @@
+ void            sleep(void*, struct spinlock*);
+ void            userinit(void);
+ int             wait(void);
++int             wait2(int*, int*, int*); // adding wait2 definition
+ void            wakeup(void*);
+ void            yield(void);
+ 
+diff -ruN Task2_old/proc.c Task2/proc.c
+--- Task2_old/proc.c	2021-09-15 22:00:35.123179400 +0530
++++ Task2/proc.c	2021-09-15 16:36:27.000000000 +0530
+@@ -88,7 +88,10 @@
+ found:
+   p->state = EMBRYO;
+   p->pid = nextpid++;
+-
++  p->ctime = ticks;
++  p->stime =0;
++  p->retime =0;
++  p->rutime =0;
+   release(&ptable.lock);
+ 
+   // Allocate kernel stack.
+@@ -532,3 +535,79 @@
+     cprintf("\n");
+   }
+ }
++
++
++void
++updateStats()
++{
++  struct proc *p;
++  acquire(&ptable.lock);
++  p = ptable.proc;
++  while(p<&ptable.proc[NPROC])
++  {
++    if(p->state == SLEEPING)
++    {
++      p->stime++;
++    }
++    else if(p->state == RUNNABLE)
++    {
++      p->retime++;
++    }
++    else if(p->state == RUNNING)
++    {
++      p->rutime++;
++    }
++    p++;
++  }
++  release(&ptable.lock);
++}
++
++int
++wait2(int *retime, int *rutime, int *stime)
++{
++  struct proc *p;
++  int havekids, pid;
++  struct proc *curproc = myproc();
++  acquire(&ptable.lock);
++  while(1){
++    // Scan through table looking for exited children.
++    havekids = 0;
++    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++      if(p->parent != curproc)
++        continue;
++      havekids = 1;
++      if(p->state == ZOMBIE){
++        //updating retime,rutime,stime of this child process
++        *retime = p->retime;
++        *rutime = p->rutime;
++        *stime = p->stime;
++
++        // Found one.
++        pid = p->pid;
++        kfree(p->kstack);
++        p->kstack = 0;
++        freevm(p->pgdir);
++        p->pid = 0;
++        p->parent = 0;
++        p->name[0] = 0;
++        p->killed = 0;
++        p->state = UNUSED;
++        p->retime=0;
++        p->rutime=0;
++        p->ctime=0;
++        p->stime=0;
++        release(&ptable.lock);
++        return pid;
++      }
++    }
++
++    // No point waiting if we don't have any children.
++    if(!havekids || curproc->killed){
++      release(&ptable.lock);
++      return -1;
++    }
++
++    // Wait for children to exit.  (See wakeup1 call in proc_exit.)
++    sleep(curproc, &ptable.lock);  //DOC: wait-sleep
++  }
++}
+\ No newline at end of file
+diff -ruN Task2_old/proc.h Task2/proc.h
+--- Task2_old/proc.h	2021-09-15 22:00:35.127294900 +0530
++++ Task2/proc.h	2021-09-15 16:42:21.000000000 +0530
+@@ -13,6 +13,8 @@
+ extern struct cpu cpus[NCPU];
+ extern int ncpu;
+ 
++
++
+ //PAGEBREAK: 17
+ // Saved registers for kernel context switches.
+ // Don't need to save all the segment registers (%cs, etc),
+@@ -49,6 +51,10 @@
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  int ctime;
++  int stime;
++  int retime;
++  int rutime;
+ };
+ 
+ // Process memory is laid out contiguously, low addresses first:
+@@ -56,3 +62,4 @@
+ //   original data and bss
+ //   fixed-size stack
+ //   expandable heap
++void updateStats();
+diff -ruN Task2_old/sh.c Task2/sh.c
+--- Task2_old/sh.c	2021-09-15 22:00:35.147398400 +0530
++++ Task2/sh.c	2021-09-16 03:11:05.000000000 +0530
+@@ -12,6 +12,8 @@
+ #define BACK  5
+ 
+ #define MAXARGS 10
++#define MAX_HISTORY 16
++#define INPUT_BUFFER 128
+ 
+ struct cmd {
+   int type;
+@@ -49,10 +51,26 @@
+   struct cmd *cmd;
+ };
+ 
++
++
++
++
+ int fork1(void);  // Fork but panics on failure.
+ void panic(char*);
+ struct cmd *parsecmd(char*);
+ 
++char cmdHistory[INPUT_BUFFER];
++
++void historyHelper() {
++  int cnt = 0;
++  for (int i = 0; i <= MAX_HISTORY-1; i++) {
++    if (history(cmdHistory, MAX_HISTORY-i-1) == 0) { 
++      cnt++;
++      printf(1, " %d: %s\n", cnt, cmdHistory);
++    }
++  }
++}
++
+ // Execute cmd.  Never returns.
+ void
+ runcmd(struct cmd *cmd)
+@@ -144,10 +162,9 @@
+ int
+ main(void)
+ {
+-  static char buf[100];
++  static char buf[INPUT_BUFFER];
+   int fd;
+ 
+-  // Ensure that three file descriptors are open.
+   while((fd = open("console", O_RDWR)) >= 0){
+     if(fd >= 3){
+       close(fd);
+@@ -155,16 +172,18 @@
+     }
+   }
+ 
+-  // Read and run input commands.
+   while(getcmd(buf, sizeof(buf)) >= 0){
+     if(buf[0] == 'c' && buf[1] == 'd' && buf[2] == ' '){
+-      // Chdir must be called by the parent, not the child.
+-      buf[strlen(buf)-1] = 0;  // chop \n
++      buf[strlen(buf)-1] = 0; 
+       if(chdir(buf+3) < 0)
+         printf(2, "cannot cd %s\n", buf+3);
+       continue;
+     }
+-    if(fork1() == 0)
++    if(buf[0]=='h'&&buf[1]=='i'&&buf[2]=='s'&&buf[3]=='t'&&buf[4] =='o'&&buf[5]=='r'&&buf[6]=='y') {
++      historyHelper();
++      continue;
++    }
++  if(fork1() == 0)
+       runcmd(parsecmd(buf));
+     wait();
+   }
+diff -ruN Task2_old/syscall.c Task2/syscall.c
+--- Task2_old/syscall.c	2021-09-15 22:00:35.240021000 +0530
++++ Task2/syscall.c	2021-09-15 19:16:28.000000000 +0530
+@@ -103,6 +103,8 @@
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++extern int sys_history(void);
++extern int sys_wait2(void);
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -126,6 +128,8 @@
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_history] sys_history,
++[SYS_wait2]   sys_wait2,
+ };
+ 
+ void
+diff -ruN Task2_old/syscall.h Task2/syscall.h
+--- Task2_old/syscall.h	2021-09-15 22:00:35.248020900 +0530
++++ Task2/syscall.h	2021-09-15 19:17:06.000000000 +0530
+@@ -20,3 +20,6 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_history  22
++#define SYS_wait2 23
++
+diff -ruN Task2_old/sysproc.c Task2/sysproc.c
+--- Task2_old/sysproc.c	2021-09-15 22:00:35.258155800 +0530
++++ Task2/sysproc.c	2021-09-15 19:18:39.000000000 +0530
+@@ -26,6 +26,18 @@
+   return wait();
+ }
+ 
++int sys_wait2(void) {
++  int *retime, *rutime, *stime;
++  if (argptr(0, (void*)&retime, sizeof(retime)) < 0)
++    return -1;
++  if (argptr(1, (void*)&rutime, sizeof(retime)) < 0)
++    return -1;
++  if (argptr(2, (void*)&stime, sizeof(stime)) < 0)
++    return -1;
++  return wait2(retime, rutime, stime);
++}
++
++
+ int
+ sys_kill(void)
+ {
+@@ -89,3 +101,9 @@
+   release(&tickslock);
+   return xticks;
+ }
++int sys_history(void) {
++  char *buffer;int historyId;
++  argptr(0, &buffer, 1);
++  argint(1, &historyId);
++  return history(buffer, historyId);
++}
+diff -ruN Task2_old/trap.c Task2/trap.c
+--- Task2_old/trap.c	2021-09-15 22:00:35.271153100 +0530
++++ Task2/trap.c	2021-09-15 20:32:45.000000000 +0530
+@@ -51,6 +51,7 @@
+     if(cpuid() == 0){
+       acquire(&tickslock);
+       ticks++;
++      updateStats(); // updating statistics of current process
+       wakeup(&ticks);
+       release(&tickslock);
+     }
+diff -ruN Task2_old/types.h Task2/types.h
+--- Task2_old/types.h	2021-09-15 22:00:35.281153500 +0530
++++ Task2/types.h	2021-09-15 23:51:59.000000000 +0530
+@@ -2,3 +2,6 @@
+ typedef unsigned short ushort;
+ typedef unsigned char  uchar;
+ typedef uint pde_t;
++
++#define INPUT_BUF 128
++#define MAX_HISTORY 16
+\ No newline at end of file
+diff -ruN Task2_old/user.h Task2/user.h
+--- Task2_old/user.h	2021-09-15 22:00:35.295153800 +0530
++++ Task2/user.h	2021-09-15 19:15:23.000000000 +0530
+@@ -23,6 +23,8 @@
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int history(char* buffer, int historyId);
++int wait2(int*, int*, int*);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff -ruN Task2_old/usys.S Task2/usys.S
+--- Task2_old/usys.S	2021-09-15 22:00:35.302155200 +0530
++++ Task2/usys.S	2021-09-15 19:14:19.000000000 +0530
+@@ -29,3 +29,5 @@
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(history)
++SYSCALL(wait2)
+\ No newline at end of file
+diff -ruN Task2_old/wait2test.c Task2/wait2test.c
+--- Task2_old/wait2test.c	1970-01-01 05:30:00.000000000 +0530
++++ Task2/wait2test.c	2021-09-15 23:00:33.788080800 +0530
+@@ -0,0 +1,20 @@
++#include "types.h"
++#include "user.h"
++#include "stat.h"
++
++int main(){
++    int retime;
++    int rutime;
++    int stime;
++    retime = 0;
++    rutime = 0;
++    stime = 0;
++    fork();
++    int pid = wait2(&retime, &rutime, &stime);
++    printf(1,"pid = %d\n", pid);
++    printf(1,"retime = %d\n", retime);
++    printf(1,"rutime = %d\n", rutime);
++    printf(1,"stime = %d\n", stime);
++    for(int i = 0; i<250; i++)printf(1,"*");
++    exit();
++}
+\ No newline at end of file

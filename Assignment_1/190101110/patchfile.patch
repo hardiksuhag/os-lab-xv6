@@ -1,0 +1,208 @@
+diff -ruN Old/Makefile New/Makefile
+--- Old/Makefile	2021-08-20 19:53:55.198248600 +0530
++++ New/Makefile	2021-08-20 13:58:58.400000100 +0530
+@@ -181,6 +181,11 @@
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_drawtest\
++# adding our function to user programs
++# ensures that the program is compiled, listed,
++# and the binary is included in fs.img
++
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+diff -ruN Old/drawtest.c New/drawtest.c
+--- Old/drawtest.c	1970-01-01 05:30:00.000000000 +0530
++++ New/drawtest.c	2021-08-20 19:19:12.421331800 +0530
+@@ -0,0 +1,28 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++
++//set maximum buffer size
++const int max_size = 6000;
++
++int main(void)
++{
++
++    // allocate the size to buffer pointer 
++    void *buffer = malloc(max_size);
++
++    // system call with image size as return value
++    int picsize = draw(buffer, max_size);
++
++    // Call returns -1 if size of image is greater than max_size
++    if (picsize == -1)
++    {
++        // print message to stdout
++        printf(1, "Insufficient buffer size\n");
++        exit();
++    }
++    
++    // print the image in buffer to stdout
++    printf(1, "%s\n", (char *)buffer);
++    exit();
++}
+\ No newline at end of file
+diff -ruN Old/syscall.c New/syscall.c
+--- Old/syscall.c	2021-08-20 19:53:55.351247500 +0530
++++ New/syscall.c	2021-08-20 13:14:07.363390800 +0530
+@@ -104,6 +104,11 @@
+ extern int sys_write(void);
+ extern int sys_uptime(void);
+ 
++
++//function prototype using extern so that the function 
++//is visible to the whole program
++extern int sys_draw(void);
++
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+ [SYS_exit]    sys_exit,
+@@ -126,6 +131,8 @@
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++// function pointer
++[SYS_draw]    sys_draw,
+ };
+ 
+ void
+diff -ruN Old/syscall.h New/syscall.h
+--- Old/syscall.h	2021-08-20 19:53:55.353247100 +0530
++++ New/syscall.h	2021-08-20 13:11:14.388249000 +0530
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++// macro for SYS_draw
++#define SYS_draw   22
+diff -ruN Old/sysproc.c New/sysproc.c
+--- Old/sysproc.c	2021-08-20 19:53:55.357249800 +0530
++++ New/sysproc.c	2021-08-20 17:56:34.854903900 +0530
+@@ -89,3 +89,100 @@
+   release(&tickslock);
+   return xticks;
+ }
++
++// fills the buffer with ascii image art for sufficient buffer 
++// size, else returns -1
++int sys_draw(void)
++{
++
++  char *picture =                                                                                                         
++  "                                        ^^.--::::::::--.^^\n\
++                                  ^-:+oyhhddddddddddddddddhhyo+:-^\n\
++                             ^-/oyhdddddddso++//:::://++ossyhddddhyo/-^\n\
++                          ./shdddddddddddhsoo++/:-.       ^^^.:/oyhdddhs/.\n\
++                       ./yhdddddddddddddhhhhddddddhyo/.          ^.-+shddhy/.\n\
++                    ^:shdddddddddddhyo/-......-:/oyhddhy/.^^^^^^.^^^^^.yddddhs:^\n\
++                  .+hddddddddddhs+-.               .:ohddhyyyhhhhhhyyyshddsohddy+.\n\
++                .ohdddddddddho:.                      ^+ddddddddddddddddddy-./yddh+.\n\
++              ^+hdddddddddy/^                          -dddddddddddddddddddd+^^:yddh+^\n\
++             :hddh++//yddh^                            -dddddddddddddddddddddy.  :hddy:\n\
++           ^oddd+^    hddo                             :ddddddddddddddddddddddh-  ^+dddo^\n\
++          .hddy-     ^ddd-                             :dddddddddddddddddddddddd:   -yddy.\n\
++         :dddo^      -ddd^                             +ddddddddddddddddddddddddd:   ^oddd:\n\
++        /ddd/        :ddd^                             odddddddddddddddddddddddddd:    /ddd:\n\
++       :ddd/         -ddd^                        ^-/shdddddddddddddddddddddddddddds:^  /ddd:\n\
++      -ddd/          .ddd-                     -/shdddhsooydddddddddddddddddddddddhddho-^/ddd-\n\
++     ^hddo           ^ddds/:-^             ^:ohdddhs/-^   ^./shdddddddddddddddddy-^:sdddy/sddh^\n\
++     oddy^          :ydddddddhyo/-.     ./shddds+-^           ^-oyddddddddddddy:^    .+hddddddo\n\
++    -ddd-         .sddddddddddddddhyo::shddhs/.^                 ^.+yddddddhs-^        ^/yddddd-\n\
++    sddy         :hdddddddddddddddddddddhs:.                        ^.+ddd+.             ^/hddds\n\
++   ^ddd:        +ddddddddddddddddddddddh.                             ^ddd:                .yddd^\n\
++   /ddd^       odddddddddddddddddddddddh                               hdd/                 ^ddd/\n\
++   oddy       +ddddddddddddddddddddddddd                               ydd+                  yddo\n\
++   yddo^^^^^^:dddddddddddddddddddddddddd                               sddo                  oddy\n\
++   hddhyyyyyyddddddddddddddddddddddddddd^                              odds                  +ddh\n\
++   hdddhhhhhhhdddddddddddddddddddddddddd^                              oddy                  +ddh\n\
++   yddo      .hddddddddddddddddddddddddd^                              +ddy                  oddy\n\
++   oddy       -ddddddddddddddddddddddddd^                              +ddy                  yddo\n\
++   :ddd^       -hddddddddddddddddddddddd                               +ddy                 ^ddd:\n\
++   ^ddd/        .ydddddddddddddddddddddd/.                             +ddy                ^oddd^\n\
++    oddy         ^sddddddddddddddddddyhddhs:^                       ^:oddddo.            ^/hdddo\n\
++    .ddd:          /dddddddddddhyo/-^^^:shddhs:.                 ^:ohdddddddhs-        ^/yddddd.\n\
++     +ddh^          -ddddyso/-.^^        .:shddhy+-^          .:ohddddddddddddds-    ./ydddddd+\n\
++     ^ydds           ddd+^                  .:oydddhs/-^  ^-+shddddddddddddddddddo.-ohddy+hddy^\n\
++      .hdd+          ddd:                      ^-/shdddysshdddddddddddddddddddddddhddhs:.oddh.\n\
++       -hdd+         ddd:                          ^-+sdddddddddddddddddddddddddddds/.  +ddh-\n\
++        -hddo^       ddd/                              sdddddddddddddddddddddddddd/   ^oddh-\n\
++         -hdds.      hdd+                              +ddddddddddddddddddddddddd/   .sddh-\n\
++          .yddh:     sdds                              +dddddddddddddddddddddddd:   :hdds.\n\
++            +dddo^   /ddd^                             /ddddddddddddddddddddddh-  .sddd+\n\
++             .ydddhyyyddd/                             /dddddddddddddddddddddo^ ^+dddy.\n\
++               :hdddddddddy/^                          +dddddddddddddddddddh- ^+hddh:\n\
++                ^/hdddddddddds/.                    ^-ohddddddddddddddddddy^-odddh/^\n\
++                  ^:ydddddddddddy+:^            .-/shdddy+++ooooooo++/:yddhydddy:^\n\
++                    ^-ohdddddddddddhyo/---::+oshhdddhs/.^            ^-yddddho-\n\
++                       ^:ohdddddddddddddddddddhyso/.^            ^-/ohdddho:^\n\
++                          ^-+shddddddddddh+/:..^          ^.-:/oyhdddhs+-^\n\
++                              .-/syhddddddyysoo++++++oosyyhhddddhys/-.\n\
++                                ^.-:+osyyhhhddddddddhhhyyso+:-.^\n\
++                                          ^^...------...^^\n\n";
++
++  char *buffer; // to store the ACII image art
++  int max_size; // to store the max buffer size
++  int picsize = 0; // to store the size of image
++
++  //Calculating size of the image
++  while (picture[picsize] != '\0')
++  {
++    picsize++;
++  }
++
++  // Get the max size of buffer from call argument (at index 1)
++  // Return -1 if invalid address is accessed
++  if (argint(1, &max_size) == -1)
++  {
++    return -1;
++  }
++
++  // Get buffer pointer from call argument and set alot buffer memory size 
++  // equal to max_size
++  // Return -1 if invalid address is accessed
++  if (argptr(0, (char **)&buffer, max_size) == -1)
++  {
++    return -1;
++  }
++
++  // return -1 if the size of image is greater than max size
++  if (picsize > max_size)
++  {
++    return -1;
++  }
++
++  //copy the image to the buffer
++  for (int i = 0; i < picsize; i++)
++  {
++    buffer[i] = picture[i];
++  }
++  //return the size of the image
++  return picsize;
++}
+\ No newline at end of file
+diff -ruN Old/user.h New/user.h
+--- Old/user.h	2021-08-20 19:53:55.375248600 +0530
++++ New/user.h	2021-08-20 13:20:34.237885600 +0530
+@@ -24,6 +24,10 @@
+ int sleep(int);
+ int uptime(void);
+ 
++// sytem call template to be given to the user
++int draw(void *buf, uint size);
++
++
+ // ulib.c
+ int stat(const char*, struct stat*);
+ char* strcpy(char*, const char*);
+diff -ruN Old/usys.S New/usys.S
+--- Old/usys.S	2021-08-20 19:53:55.380249700 +0530
++++ New/usys.S	2021-08-20 13:19:07.408748600 +0530
+@@ -29,3 +29,4 @@
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(draw)
